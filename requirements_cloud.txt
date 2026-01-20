@@ -1,0 +1,51 @@
+# Dream Vision - AWS Cloud Requirements
+# Optimized for AWS G6 Instance (NVIDIA L4 - 24GB VRAM)
+# Python 3.11 recommended
+
+# ===========================================
+# PyTorch with CUDA 12.1
+# Install separately with:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# ===========================================
+
+# Core ML/AI Libraries (versions for CUDA 12.1)
+# torch>=2.1.0
+# torchvision>=0.16.0
+# torchaudio>=2.1.0
+
+# Diffusers and Transformers
+diffusers>=0.24.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# xformers for memory optimization
+xformers>=0.0.23
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+mediapipe==0.10.9
+
+# Image Processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Model Loading
+safetensors>=0.4.0
+
+# Utilities
+tqdm>=4.66.0
+
+# ===========================================
+# Optional - For streaming/API features
+# ===========================================
+# flask>=3.0.0
+# flask-cors>=4.0.0
+# gunicorn>=21.0.0
+# python-socketio>=5.10.0
+
+# ===========================================
+# Optional - For advanced video processing
+# ===========================================
+# ffmpeg-python>=0.2.0
+# av>=11.0.0

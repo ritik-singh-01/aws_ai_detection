@@ -1,0 +1,142 @@
+================================================================================
+  DREAM VISION - AWS CLOUD QUICK START
+  Run AI Art Generation on AWS G6 (NVIDIA L4 - 24GB VRAM)
+================================================================================
+
+STEP 1: LAUNCH AWS INSTANCE
+---------------------------
+1. Go to AWS Console > EC2 > Launch Instance
+2. Choose AMI: "Deep Learning AMI GPU PyTorch 2.1 (Ubuntu 22.04)"
+3. Instance Type: g6.xlarge (or g6.2xlarge for more CPU)
+4. Storage: 100 GB gp3
+5. Create/select key pair (download .pem file)
+6. Launch and wait for "Running" status
+
+STEP 2: CONNECT TO INSTANCE
+---------------------------
+Open PowerShell/Terminal:
+
+    ssh -i dreamvision-key.pem ubuntu@<YOUR_INSTANCE_IP>
+
+(Replace <YOUR_INSTANCE_IP> with your EC2 public IP)
+
+STEP 3: UPLOAD FILES
+--------------------
+From your local machine (new terminal window):
+
+    # Upload project files
+    scp -i dreamvision-key.pem -r "C:\Ai project\DreamVision\aws_cloud_deployment\*" ubuntu@<IP>:~/dream_vision/
+
+    # Upload your video
+    scp -i dreamvision-key.pem "C:\path\to\your\video.mp4" ubuntu@<IP>:~/dream_vision/input.mp4
+
+STEP 4: RUN SETUP
+-----------------
+On the EC2 instance:
+
+    cd ~/dream_vision
+    chmod +x setup_aws.sh
+    ./setup_aws.sh
+
+(Takes 10-15 minutes. If reboot required, reconnect and run again)
+
+STEP 5: PROCESS VIDEO
+---------------------
+On the EC2 instance:
+
+    cd ~/dream_vision
+    source venv/bin/activate
+    python dream_vision_cloud.py --input input.mp4 --output output.mp4
+
+Or use the easy runner:
+
+    chmod +x run_cloud.sh
+    ./run_cloud.sh input.mp4 output.mp4
+
+STEP 6: DOWNLOAD RESULT
+-----------------------
+From your local machine:
+
+    scp -i dreamvision-key.pem ubuntu@<IP>:~/dream_vision/output.mp4 ./
+
+STEP 7: STOP INSTANCE (SAVE MONEY!)
+-----------------------------------
+When done, go to AWS Console > EC2 > Select instance > Stop
+
+================================================================================
+
+COMMAND OPTIONS
+---------------
+
+Basic:
+    python dream_vision_cloud.py --input video.mp4
+
+With output name:
+    python dream_vision_cloud.py --input video.mp4 --output result.mp4
+
+Higher quality (slower):
+    python dream_vision_cloud.py --input video.mp4 --steps 4 --strength 0.6
+
+Higher resolution (L4 can handle 1024x1024):
+    python dream_vision_cloud.py --input video.mp4 --width 1024 --height 1024
+
+Custom style:
+    python dream_vision_cloud.py --input video.mp4 --prompt "cyberpunk neon city"
+
+================================================================================
+
+EXPECTED PERFORMANCE (G6 - L4 GPU)
+----------------------------------
+
+Resolution    Steps    FPS        Quality
+-----------------------------------------
+512x512       1        35-45      Good
+768x768       2        18-25      Best (Default)
+1024x1024     2        10-15      HD
+
+================================================================================
+
+COST ESTIMATE
+-------------
+g6.xlarge: ~$0.80/hour
+g6.2xlarge: ~$1.00/hour
+
+Tip: Use Spot Instances for 60-90% savings!
+
+1 minute video  = ~$0.03
+10 minute video = ~$0.27
+1 hour video    = ~$1.60
+
+================================================================================
+
+TROUBLESHOOTING
+---------------
+
+"CUDA not available"
+    -> Check: nvidia-smi
+    -> If no output, reboot: sudo reboot
+
+"No such file"
+    -> Make sure you uploaded files to ~/dream_vision/
+
+"Permission denied"
+    -> Run: chmod +x setup_aws.sh run_cloud.sh
+
+Connection lost during processing?
+    -> Use screen: screen -S dv
+    -> Run your command
+    -> Detach: Ctrl+A, D
+    -> Reconnect later: screen -r dv
+
+================================================================================
+
+FILES IN THIS PACKAGE
+---------------------
+dream_vision_cloud.py    - Main application (L4 optimized)
+setup_aws.sh             - Installation script
+run_cloud.sh             - Easy run script
+requirements_cloud.txt   - Python dependencies
+AWS_DEPLOYMENT_GUIDE.md  - Full documentation
+QUICK_START_AWS.txt      - This file
+
+================================================================================
