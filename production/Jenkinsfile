@@ -1,0 +1,311 @@
+// =============================================================================
+// Dream Vision - Jenkins CI/CD Pipeline
+// Production-ready pipeline for building, testing, and deploying
+// =============================================================================
+
+pipeline {
+    agent {
+        label 'docker-gpu'  // Agent with Docker and NVIDIA GPU support
+    }
+
+    environment {
+        // Docker Registry
+        DOCKER_REGISTRY = credentials('docker-registry-url')
+        DOCKER_CREDENTIALS = credentials('docker-registry-credentials')
+
+        // Image Configuration
+        IMAGE_NAME = 'dreamvision'
+        IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+
+        // AWS Configuration (for ECR)
+        AWS_REGION = 'us-east-1'
+        ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        // Application Configuration
+        APP_VERSION = readFile('VERSION').trim() ?: '1.0.0'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        // =====================================================================
+        // Stage 1: Checkout & Preparation
+        // =====================================================================
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_BRANCH_NAME = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+                echo "Building branch: ${env.GIT_BRANCH_NAME}"
+                echo "Commit: ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+
+        // =====================================================================
+        // Stage 2: Code Quality & Linting
+        // =====================================================================
+        stage('Code Quality') {
+            parallel {
+                stage('Python Lint') {
+                    steps {
+                        sh '''
+                            pip install flake8 pylint black --quiet
+                            echo "Running flake8..."
+                            flake8 aws_cloud_deployment/*.py --max-line-length=120 --ignore=E501,W503 || true
+                            echo "Running black check..."
+                            black --check --line-length=120 aws_cloud_deployment/*.py || true
+                        '''
+                    }
+                }
+                stage('Security Scan') {
+                    steps {
+                        sh '''
+                            pip install bandit safety --quiet
+                            echo "Running bandit security scan..."
+                            bandit -r aws_cloud_deployment/*.py -f json -o bandit-report.json || true
+                            echo "Checking dependencies for vulnerabilities..."
+                            safety check -r aws_cloud_deployment/requirements_cloud.txt || true
+                        '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 3: Build Docker Image
+        // =====================================================================
+        stage('Build Docker Image') {
+            steps {
+                dir('aws_cloud_deployment') {
+                    script {
+                        echo "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+                        // Build with cache for faster builds
+                        docker.build(
+                            "${IMAGE_NAME}:${IMAGE_TAG}",
+                            "-f production/Dockerfile --build-arg BUILDKIT_INLINE_CACHE=1 ."
+                        )
+
+                        // Tag as latest for main branch
+                        if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
+                            sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 4: Test Docker Image
+        // =====================================================================
+        stage('Test Image') {
+            steps {
+                script {
+                    echo "Testing Docker image..."
+
+                    // Test 1: Check image builds correctly
+                    sh "docker inspect ${IMAGE_NAME}:${IMAGE_TAG}"
+
+                    // Test 2: Verify Python and dependencies
+                    sh """
+                        docker run --rm ${IMAGE_NAME}:${IMAGE_TAG} \
+                            python3.11 -c "
+import torch
+import cv2
+import numpy as np
+from PIL import Image
+from diffusers import AutoPipelineForImage2Image
+print('All imports successful!')
+print(f'PyTorch version: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+"
+                    """
+
+                    // Test 3: Check entrypoint
+                    sh "docker run --rm ${IMAGE_NAME}:${IMAGE_TAG} --help"
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 5: GPU Integration Test (if GPU available)
+        // =====================================================================
+        stage('GPU Test') {
+            when {
+                expression {
+                    // Only run if GPU is available on build agent
+                    return sh(script: 'nvidia-smi', returnStatus: true) == 0
+                }
+            }
+            steps {
+                script {
+                    echo "Running GPU integration test..."
+                    sh """
+                        docker run --rm --gpus all ${IMAGE_NAME}:${IMAGE_TAG} \
+                            python3.11 -c "
+import torch
+assert torch.cuda.is_available(), 'CUDA not available!'
+print(f'GPU: {torch.cuda.get_device_name(0)}')
+print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')
+print('GPU test passed!')
+"
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 6: Push to Registry
+        // =====================================================================
+        stage('Push to Registry') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                    branch 'release/*'
+                    tag pattern: 'v\\d+\\.\\d+\\.\\d+', comparator: 'REGEXP'
+                }
+            }
+            parallel {
+                // Push to Docker Hub / Private Registry
+                stage('Push to Docker Registry') {
+                    when {
+                        expression { return env.DOCKER_REGISTRY != null }
+                    }
+                    steps {
+                        script {
+                            docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                                def image = docker.image("${IMAGE_NAME}:${IMAGE_TAG}")
+                                image.push()
+                                image.push('latest')
+                            }
+                        }
+                    }
+                }
+
+                // Push to AWS ECR
+                stage('Push to ECR') {
+                    when {
+                        expression { return env.AWS_ACCOUNT_ID != null }
+                    }
+                    steps {
+                        script {
+                            sh """
+                                aws ecr get-login-password --region ${AWS_REGION} | \
+                                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                                docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                                docker push ${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+
+                                docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REGISTRY}/${IMAGE_NAME}:latest
+                                docker push ${ECR_REGISTRY}/${IMAGE_NAME}:latest
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 7: Deploy to AWS (Optional)
+        // =====================================================================
+        stage('Deploy to AWS') {
+            when {
+                anyOf {
+                    branch 'main'
+                    tag pattern: 'v\\d+\\.\\d+\\.\\d+', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    echo "Deploying to AWS ECS/EC2..."
+                    // Uncomment and configure for your deployment
+                    /*
+                    sh '''
+                        aws ecs update-service \
+                            --cluster dreamvision-cluster \
+                            --service dreamvision-service \
+                            --force-new-deployment \
+                            --region ${AWS_REGION}
+                    '''
+                    */
+                }
+            }
+        }
+
+        // =====================================================================
+        // Stage 8: Cleanup
+        // =====================================================================
+        stage('Cleanup') {
+            steps {
+                sh """
+                    # Remove dangling images
+                    docker image prune -f
+
+                    # Remove old build images (keep last 5)
+                    docker images ${IMAGE_NAME} --format '{{.ID}} {{.Tag}}' | \
+                        grep -v latest | \
+                        tail -n +6 | \
+                        awk '{print \$1}' | \
+                        xargs -r docker rmi -f || true
+                """
+            }
+        }
+    }
+
+    // =========================================================================
+    // Post-Build Actions
+    // =========================================================================
+    post {
+        always {
+            // Archive artifacts
+            archiveArtifacts artifacts: '**/logs/**', allowEmptyArchive: true
+
+            // Cleanup workspace
+            cleanWs()
+        }
+
+        success {
+            echo "Build successful! Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+            // Send notification (Slack/Teams/Email)
+            // slackSend channel: '#builds', color: 'good', message: "Dream Vision build successful: ${IMAGE_TAG}"
+        }
+
+        failure {
+            echo "Build failed!"
+
+            // Send failure notification
+            // slackSend channel: '#builds', color: 'danger', message: "Dream Vision build FAILED: ${env.BUILD_URL}"
+        }
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+def getVersion() {
+    if (fileExists('VERSION')) {
+        return readFile('VERSION').trim()
+    }
+    return '1.0.0'
+}

@@ -1,5 +1,5 @@
 """
-- AWS CLOUD VERSION
+Dream Vision - AWS CLOUD VERSION
 =================================================
 Optimized for AWS G6 Instance with NVIDIA L4 GPU (24GB VRAM)
 High-performance cloud deployment for real-time AI art generation.
@@ -7,13 +7,13 @@ High-performance cloud deployment for real-time AI art generation.
 Hardware Target: AWS g6.xlarge / g6.2xlarge (NVIDIA L4 - 24GB VRAM)
 Expected Performance: 25-40 FPS at 768x768 resolution
 
-Key Cloud Optimizations:
-1. Higher resolution support (768x768) due to 24GB VRAM
-2. Batch processing capability
-3. Video file input support (no physical webcam)
-4. RTMP/WebRTC streaming output
-5. HTTP API for remote control
-6. Headless operation mode
+Key Features:
+1. Multi-person detection and individual processing
+2. Gender auto-detection for adaptive prompts
+3. Face and body preservation (protected from transformation)
+4. Higher resolution support (768x768) due to 24GB VRAM
+5. Video file input support (no physical webcam)
+6. Headless operation mode for cloud deployment
 
 Author: AI Creative Technologist
 """
@@ -44,8 +44,19 @@ except ImportError:
 
 from diffusers import AutoPipelineForImage2Image
 import warnings
+from enum import Enum
 
 warnings.filterwarnings("ignore")
+
+
+# ============================================================================
+# GENDER ENUM
+# ============================================================================
+class Gender(Enum):
+    UNKNOWN = "unknown"
+    MALE = "male"
+    FEMALE = "female"
+    MIXED = "mixed"  # Multiple people with different genders
 
 # Force high performance CUDA settings
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -76,17 +87,61 @@ class CloudConfig:
     # Consistency
     fixed_seed: int = 42
 
-    # Prompts
-    prompt: str = (
-        "dreamy surreal oil painting, ethereal portrait, "
-        "mystical glowing atmosphere, soft venetian mist, "
-        "golden luminescent light, renaissance masterpiece, "
-        "Nikas Safronov dream vision, 8k ultra detailed"
+    # Base Prompts (will be enhanced based on detected gender)
+    base_prompt: str = (
+        "dreamy surreal oil painting, ethereal atmosphere, "
+        "mystical glowing environment, soft venetian mist, "
+        "golden luminescent light, renaissance masterpiece style, "
+        "Nikas Safronov dream vision, 8k ultra detailed, "
+        "preserve human features exactly, maintain facial identity"
     )
+
+    # Gender-specific prompt additions
+    male_prompt_addition: str = (
+        "handsome man, masculine features preserved, "
+        "strong facial structure maintained"
+    )
+    female_prompt_addition: str = (
+        "beautiful woman, feminine features preserved, "
+        "elegant facial structure maintained"
+    )
+
+    # Negative prompt - CRITICAL for face/body preservation
     negative_prompt: str = (
-        "ugly, blurry, low quality, distorted, deformed, "
-        "dark, harsh, pixelated, noisy"
+        # Quality issues
+        "ugly, blurry, low quality, pixelated, noisy, "
+        # Face protection - DO NOT alter these
+        "deformed face, distorted face, disfigured face, bad face, "
+        "mutated face, ugly face, poorly drawn face, cloned face, "
+        "extra faces, duplicate faces, fused faces, "
+        "wrong facial features, asymmetric eyes, "
+        # Body protection - DO NOT alter these
+        "deformed body, distorted body, disfigured body, "
+        "mutated body, extra limbs, missing limbs, "
+        "extra arms, missing arms, extra legs, missing legs, "
+        "extra fingers, missing fingers, fused fingers, "
+        "bad anatomy, wrong anatomy, bad proportions, "
+        "extra hands, malformed hands, poorly drawn hands, "
+        # Skin and appearance protection
+        "bad skin, unnatural skin, plastic skin, "
+        "doll-like appearance, mannequin, "
+        # General quality
+        "watermark, signature, text, logo, "
+        "cropped, out of frame, worst quality"
     )
+
+    # Face/Body Preservation Settings
+    face_preservation_strength: float = 0.85  # How much to preserve face (0.0-1.0)
+    body_preservation_strength: float = 0.60  # How much to preserve body (0.0-1.0)
+    background_transform_strength: float = 0.95  # How much to transform background
+
+    # Multi-person Settings
+    max_persons: int = 10  # Maximum number of persons to detect
+    min_detection_confidence: float = 0.5  # Minimum confidence for person detection
+
+    # Gender Detection Settings
+    enable_gender_detection: bool = True
+    gender_detection_confidence: float = 0.6
 
     # Performance - Optimized for L4
     queue_size: int = 4  # Larger queue for cloud
@@ -110,6 +165,11 @@ class CloudConfig:
     # API Server
     enable_api: bool = False
     api_port: int = 8080
+
+    @property
+    def prompt(self) -> str:
+        """Default prompt (used when no gender detected)"""
+        return self.base_prompt
 
 
 # ============================================================================
@@ -156,72 +216,437 @@ class CUDAMemoryManager:
 
 
 # ============================================================================
-# PERSON SEGMENTER - CLOUD VERSION
+# PERSON DATA CLASS
 # ============================================================================
-class CloudPersonSegmenter:
+@dataclass
+class PersonInfo:
+    """Information about a detected person"""
+    id: int
+    bbox: Tuple[int, int, int, int]  # x, y, width, height
+    face_bbox: Optional[Tuple[int, int, int, int]] = None
+    gender: Gender = Gender.UNKNOWN
+    confidence: float = 0.0
+    face_landmarks: Optional[List] = None
+    body_landmarks: Optional[List] = None
+
+
+# ============================================================================
+# ADVANCED MULTI-PERSON DETECTOR WITH GENDER DETECTION
+# ============================================================================
+class MultiPersonDetector:
     """
-    Person segmentation with fallback for headless cloud operation.
+    Advanced multi-person detection with:
+    - Individual person detection and tracking
+    - Gender classification
+    - Face landmark detection
+    - Body pose estimation
     """
 
-    def __init__(self, target_size: Tuple[int, int] = (768, 768)):
-        self.target_size = target_size
-        self.segmenter = None
+    def __init__(self, config: CloudConfig):
+        self.config = config
+        self.target_size = (config.width, config.height)
+
+        # Initialize MediaPipe components
+        self.face_detection = None
+        self.face_mesh = None
+        self.pose = None
+        self.selfie_segmentation = None
+
+        if MEDIAPIPE_AVAILABLE:
+            self._init_mediapipe()
+        else:
+            print("[MultiPersonDetector] MediaPipe not available - using fallback")
+
+        # Pre-allocate kernels for morphological operations
+        self._kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+
+        print("[MultiPersonDetector] Initialized")
+
+    def _init_mediapipe(self):
+        """Initialize all MediaPipe components"""
+        try:
+            # Face Detection - for detecting multiple faces
+            self.mp_face_detection = mp.solutions.face_detection
+            self.face_detection = self.mp_face_detection.FaceDetection(
+                model_selection=1,  # 1 for full range (up to 5m)
+                min_detection_confidence=self.config.min_detection_confidence
+            )
+            print("[MediaPipe] Face Detection: ENABLED")
+        except Exception as e:
+            print(f"[MediaPipe] Face Detection failed: {e}")
+
+        try:
+            # Face Mesh - for detailed face landmarks (gender estimation)
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=self.config.max_persons,
+                refine_landmarks=True,
+                min_detection_confidence=self.config.min_detection_confidence,
+                min_tracking_confidence=0.5
+            )
+            print("[MediaPipe] Face Mesh: ENABLED")
+        except Exception as e:
+            print(f"[MediaPipe] Face Mesh failed: {e}")
+
+        try:
+            # Pose Detection - for body landmarks
+            self.mp_pose = mp.solutions.pose
+            self.pose = self.mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=1,
+                enable_segmentation=True,
+                min_detection_confidence=self.config.min_detection_confidence
+            )
+            print("[MediaPipe] Pose: ENABLED")
+        except Exception as e:
+            print(f"[MediaPipe] Pose failed: {e}")
+
+        try:
+            # Selfie Segmentation - for person/background separation
+            self.mp_selfie = mp.solutions.selfie_segmentation
+            self.selfie_segmentation = self.mp_selfie.SelfieSegmentation(model_selection=1)
+            print("[MediaPipe] Selfie Segmentation: ENABLED")
+        except Exception as e:
+            print(f"[MediaPipe] Selfie Segmentation failed: {e}")
+
+    def detect_persons(self, frame: np.ndarray) -> List[PersonInfo]:
+        """
+        Detect all persons in frame with their properties.
+
+        Returns:
+            List of PersonInfo objects for each detected person
+        """
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        persons = []
+
+        if self.face_detection is None:
+            # Fallback: return single dummy person
+            return [PersonInfo(id=0, bbox=(0, 0, w, h), gender=Gender.UNKNOWN)]
+
+        # Detect faces
+        face_results = self.face_detection.process(rgb)
+
+        if face_results.detections:
+            for idx, detection in enumerate(face_results.detections):
+                if idx >= self.config.max_persons:
+                    break
+
+                # Get bounding box
+                bbox = detection.location_data.relative_bounding_box
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                box_w = int(bbox.width * w)
+                box_h = int(bbox.height * h)
+
+                # Expand bbox to include body (approximate)
+                body_x = max(0, x - box_w // 2)
+                body_y = max(0, y - box_h // 4)
+                body_w = min(w - body_x, box_w * 2)
+                body_h = min(h - body_y, int(box_h * 4))
+
+                # Detect gender from face proportions and features
+                gender = self._estimate_gender(rgb, (x, y, box_w, box_h))
+
+                person = PersonInfo(
+                    id=idx,
+                    bbox=(body_x, body_y, body_w, body_h),
+                    face_bbox=(x, y, box_w, box_h),
+                    gender=gender,
+                    confidence=detection.score[0] if detection.score else 0.5
+                )
+                persons.append(person)
+
+        # If no faces detected, try to detect body
+        if not persons and self.selfie_segmentation:
+            seg_results = self.selfie_segmentation.process(rgb)
+            if seg_results.segmentation_mask is not None:
+                mask = seg_results.segmentation_mask
+                if np.any(mask > 0.5):
+                    # Person detected but no face visible
+                    persons.append(PersonInfo(
+                        id=0,
+                        bbox=(0, 0, w, h),
+                        gender=Gender.UNKNOWN,
+                        confidence=0.5
+                    ))
+
+        return persons if persons else [PersonInfo(id=0, bbox=(0, 0, w, h), gender=Gender.UNKNOWN)]
+
+    def _estimate_gender(self, rgb: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Gender:
+        """
+        Estimate gender from facial features using face mesh landmarks.
+        Uses facial proportions and structure for classification.
+        """
+        if not self.config.enable_gender_detection or self.face_mesh is None:
+            return Gender.UNKNOWN
+
+        x, y, w, h = face_bbox
+        img_h, img_w = rgb.shape[:2]
+
+        # Extract face region with padding
+        pad = int(max(w, h) * 0.3)
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(img_w, x + w + pad)
+        y2 = min(img_h, y + h + pad)
+
+        face_roi = rgb[y1:y2, x1:x2]
+        if face_roi.size == 0:
+            return Gender.UNKNOWN
+
+        # Get face mesh landmarks
+        results = self.face_mesh.process(face_roi)
+
+        if not results.multi_face_landmarks:
+            return Gender.UNKNOWN
+
+        landmarks = results.multi_face_landmarks[0]
+
+        # Gender estimation based on facial proportions
+        # These are approximate heuristics based on typical facial differences
+        try:
+            # Get key landmark points
+            roi_h, roi_w = face_roi.shape[:2]
+
+            # Jawline width (landmarks 234, 454 are jaw corners)
+            jaw_left = landmarks.landmark[234]
+            jaw_right = landmarks.landmark[454]
+            jaw_width = abs(jaw_right.x - jaw_left.x) * roi_w
+
+            # Face height (from chin to forehead)
+            chin = landmarks.landmark[152]
+            forehead = landmarks.landmark[10]
+            face_height = abs(forehead.y - chin.y) * roi_h
+
+            # Eyebrow thickness (distance between eyebrow landmarks)
+            left_brow_top = landmarks.landmark[105]
+            left_brow_bottom = landmarks.landmark[107]
+            brow_thickness = abs(left_brow_top.y - left_brow_bottom.y) * roi_h
+
+            # Nose width
+            nose_left = landmarks.landmark[279]
+            nose_right = landmarks.landmark[49]
+            nose_width = abs(nose_right.x - nose_left.x) * roi_w
+
+            # Calculate ratios
+            jaw_to_height_ratio = jaw_width / face_height if face_height > 0 else 0
+            brow_ratio = brow_thickness / face_height if face_height > 0 else 0
+            nose_ratio = nose_width / jaw_width if jaw_width > 0 else 0
+
+            # Scoring based on typical gender differences
+            # Males typically have: wider jaw, thicker eyebrows, wider nose
+            male_score = 0
+
+            if jaw_to_height_ratio > 0.85:  # Wider jaw
+                male_score += 1
+            if brow_ratio > 0.025:  # Thicker eyebrows
+                male_score += 1
+            if nose_ratio > 0.28:  # Wider nose relative to jaw
+                male_score += 1
+
+            # Determine gender
+            if male_score >= 2:
+                return Gender.MALE
+            elif male_score <= 0:
+                return Gender.FEMALE
+            else:
+                return Gender.UNKNOWN
+
+        except Exception as e:
+            return Gender.UNKNOWN
+
+    def get_overall_gender(self, persons: List[PersonInfo]) -> Gender:
+        """
+        Determine overall gender for prompt generation.
+        """
+        if not persons:
+            return Gender.UNKNOWN
+
+        genders = [p.gender for p in persons if p.gender != Gender.UNKNOWN]
+
+        if not genders:
+            return Gender.UNKNOWN
+        elif len(set(genders)) == 1:
+            return genders[0]
+        else:
+            return Gender.MIXED
+
+    def release(self):
+        """Release all MediaPipe resources"""
+        if self.face_detection:
+            self.face_detection.close()
+        if self.face_mesh:
+            self.face_mesh.close()
+        if self.pose:
+            self.pose.close()
+        if self.selfie_segmentation:
+            self.selfie_segmentation.close()
+
+
+# ============================================================================
+# ADVANCED SEGMENTATION WITH FACE/BODY PRESERVATION
+# ============================================================================
+class AdvancedSegmenter:
+    """
+    Advanced segmentation that creates separate masks for:
+    - Face regions (highest preservation)
+    - Body regions (medium preservation)
+    - Background (full transformation)
+    """
+
+    def __init__(self, config: CloudConfig):
+        self.config = config
+        self.target_size = (config.width, config.height)
+
+        # Initialize MediaPipe
+        self.selfie_segmentation = None
+        self.face_mesh = None
 
         if MEDIAPIPE_AVAILABLE:
             try:
                 self.mp_selfie = mp.solutions.selfie_segmentation
-                self.segmenter = self.mp_selfie.SelfieSegmentation(model_selection=1)
-                print("[Segmenter] MediaPipe initialized")
+                self.selfie_segmentation = self.mp_selfie.SelfieSegmentation(model_selection=1)
+
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.face_mesh = self.mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=config.max_persons,
+                    refine_landmarks=True,
+                    min_detection_confidence=config.min_detection_confidence
+                )
+                print("[AdvancedSegmenter] MediaPipe initialized")
             except Exception as e:
-                print(f"[Segmenter] MediaPipe failed: {e}")
+                print(f"[AdvancedSegmenter] MediaPipe failed: {e}")
 
-        if self.segmenter is None:
-            print("[Segmenter] Using simple background detection fallback")
-
-        # Pre-allocate kernel
+        # Morphological kernels
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
 
-    def segment(self, frame: np.ndarray) -> np.ndarray:
+    def create_preservation_masks(
+        self,
+        frame: np.ndarray,
+        persons: List[PersonInfo]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Generate person segmentation mask.
-        Returns float mask (0.0-1.0)
+        Create three separate masks for different preservation levels.
+
+        Returns:
+            Tuple of (face_mask, body_mask, background_mask)
+            All masks are float arrays (0.0-1.0)
         """
         h, w = frame.shape[:2]
-        if (w, h) != self.target_size:
-            frame = cv2.resize(frame, self.target_size, interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if self.segmenter is not None:
-            # MediaPipe segmentation
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.segmenter.process(rgb)
-            mask = results.segmentation_mask
-        else:
-            # Fallback: Simple GrabCut-based segmentation
-            mask = self._fallback_segment(frame)
+        # Initialize masks
+        face_mask = np.zeros((h, w), dtype=np.float32)
+        body_mask = np.zeros((h, w), dtype=np.float32)
+        person_mask = np.zeros((h, w), dtype=np.float32)
 
-        # Clean up mask
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel)
-        mask = cv2.GaussianBlur(mask, (7, 7), 0)
+        # Get person segmentation mask
+        if self.selfie_segmentation:
+            results = self.selfie_segmentation.process(rgb)
+            if results.segmentation_mask is not None:
+                person_mask = results.segmentation_mask.copy()
+
+        # Create face masks from detected persons
+        for person in persons:
+            if person.face_bbox:
+                face_mask = self._add_face_mask(face_mask, rgb, person.face_bbox)
+
+        # Create detailed face mask from face mesh
+        if self.face_mesh:
+            mesh_results = self.face_mesh.process(rgb)
+            if mesh_results.multi_face_landmarks:
+                for face_landmarks in mesh_results.multi_face_landmarks:
+                    face_mask = self._add_face_mesh_mask(face_mask, face_landmarks, w, h)
+
+        # Clean up face mask
+        face_mask = cv2.morphologyEx(face_mask, cv2.MORPH_CLOSE, self._kernel)
+        face_mask = cv2.GaussianBlur(face_mask, (21, 21), 0)
+        face_mask = np.clip(face_mask, 0, 1)
+
+        # Body mask = person mask - face mask
+        body_mask = np.maximum(0, person_mask - face_mask)
+        body_mask = cv2.GaussianBlur(body_mask, (11, 11), 0)
+
+        # Background mask = inverse of person mask
+        background_mask = 1.0 - person_mask
+        background_mask = cv2.GaussianBlur(background_mask, (7, 7), 0)
+
+        return face_mask, body_mask, background_mask
+
+    def _add_face_mask(
+        self,
+        mask: np.ndarray,
+        rgb: np.ndarray,
+        face_bbox: Tuple[int, int, int, int]
+    ) -> np.ndarray:
+        """Add elliptical face mask from bounding box"""
+        x, y, w, h = face_bbox
+        img_h, img_w = mask.shape
+
+        # Create ellipse for face
+        center_x = x + w // 2
+        center_y = y + h // 2
+
+        # Make ellipse slightly larger than bbox
+        axis_x = int(w * 0.7)
+        axis_y = int(h * 0.85)
+
+        # Ensure within bounds
+        center_x = max(axis_x, min(img_w - axis_x, center_x))
+        center_y = max(axis_y, min(img_h - axis_y, center_y))
+
+        # Draw filled ellipse
+        cv2.ellipse(
+            mask,
+            (center_x, center_y),
+            (axis_x, axis_y),
+            0, 0, 360,
+            1.0,
+            -1  # Filled
+        )
 
         return mask
 
-    def _fallback_segment(self, frame: np.ndarray) -> np.ndarray:
-        """Simple fallback segmentation when MediaPipe unavailable"""
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def _add_face_mesh_mask(
+        self,
+        mask: np.ndarray,
+        landmarks,
+        width: int,
+        height: int
+    ) -> np.ndarray:
+        """Add detailed face mask from face mesh landmarks"""
+        # Face oval indices in MediaPipe Face Mesh
+        FACE_OVAL = [
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+        ]
 
-        # Use adaptive thresholding to detect foreground
-        blur = cv2.GaussianBlur(gray, (21, 21), 0)
-        mask = cv2.adaptiveThreshold(
-            blur, 1.0, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        ).astype(np.float32)
+        points = []
+        for idx in FACE_OVAL:
+            lm = landmarks.landmark[idx]
+            x = int(lm.x * width)
+            y = int(lm.y * height)
+            points.append([x, y])
+
+        if len(points) > 2:
+            points = np.array(points, dtype=np.int32)
+            cv2.fillPoly(mask, [points], 1.0)
 
         return mask
 
     def release(self):
-        if self.segmenter is not None:
-            self.segmenter.close()
+        """Release MediaPipe resources"""
+        if self.selfie_segmentation:
+            self.selfie_segmentation.close()
+        if self.face_mesh:
+            self.face_mesh.close()
 
 
 # ============================================================================
@@ -383,18 +808,25 @@ class CloudDiffusionPipeline:
 
 
 # ============================================================================
-# CLOUD FRAME PROCESSOR
+# CLOUD FRAME PROCESSOR - ENHANCED WITH MULTI-PERSON & PRESERVATION
 # ============================================================================
 class CloudFrameProcessor:
-    """High-performance frame processor for cloud deployment"""
+    """
+    High-performance frame processor with:
+    - Multi-person detection
+    - Gender-aware prompt generation
+    - Face and body preservation
+    """
 
     def __init__(
         self,
         pipeline: CloudDiffusionPipeline,
-        segmenter: CloudPersonSegmenter,
+        person_detector: MultiPersonDetector,
+        segmenter: AdvancedSegmenter,
         config: CloudConfig
     ):
         self.pipeline = pipeline
+        self.person_detector = person_detector
         self.segmenter = segmenter
         self.config = config
 
@@ -413,6 +845,10 @@ class CloudFrameProcessor:
         self._last_fps_time = time.time()
         self._process_times = []
         self._total_frames = 0
+
+        # Detection stats
+        self.last_detected_persons = 0
+        self.last_detected_gender = Gender.UNKNOWN
 
     def start(self):
         """Start processing thread"""
@@ -481,35 +917,87 @@ class CloudFrameProcessor:
                 traceback.print_exc()
 
     def _process(self, frame: np.ndarray) -> np.ndarray:
-        """Process single frame"""
+        """
+        Process single frame with:
+        - Multi-person detection
+        - Gender detection
+        - Face/body preservation
+        """
         target = (self.config.width, self.config.height)
         h, w = frame.shape[:2]
 
         if (w, h) != target:
             frame = cv2.resize(frame, target, interpolation=cv2.INTER_LINEAR)
 
-        # Get segmentation mask
-        mask = self.segmenter.segment(frame)
+        # Step 1: Detect all persons and their properties
+        persons = self.person_detector.detect_persons(frame)
+        self.last_detected_persons = len(persons)
 
-        # Convert to PIL
+        # Step 2: Determine overall gender for prompt adaptation
+        overall_gender = self.person_detector.get_overall_gender(persons)
+        self.last_detected_gender = overall_gender
+
+        # Step 3: Create preservation masks (face, body, background)
+        # Note: background is implicitly the area not covered by face/body masks
+        face_mask, body_mask, _background_mask = self.segmenter.create_preservation_masks(
+            frame, persons
+        )
+
+        # Step 4: Convert to PIL for transformation
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
 
-        # Transform
+        # Step 5: Transform the image
         transformed = self.pipeline.transform(pil_img)
         transformed_np = np.array(transformed)
 
-        # Blend with mask
+        # Step 6: Advanced blending with different preservation levels
         original_rgb = rgb.astype(np.float32)
         transformed_f = transformed_np.astype(np.float32)
-        mask_3ch = np.stack([mask] * 3, axis=-1)
 
-        # Subject preservation
-        subject_factor = 0.3
-        blended = (
-            mask_3ch * (subject_factor * original_rgb + (1 - subject_factor) * transformed_f) +
-            (1 - mask_3ch) * transformed_f
-        ).astype(np.uint8)
+        # Create 3-channel masks for blending
+        face_mask_3ch = np.stack([face_mask] * 3, axis=-1)
+        body_mask_3ch = np.stack([body_mask] * 3, axis=-1)
+        # Note: background_mask used implicitly (areas not covered by face/body)
+
+        # Get preservation strengths from config
+        face_preserve = self.config.face_preservation_strength
+        body_preserve = self.config.body_preservation_strength
+        bg_transform = self.config.background_transform_strength
+
+        # Blend each region with appropriate preservation level
+        # Face: High preservation (keep most of original)
+        face_blend = (
+            face_preserve * original_rgb +
+            (1 - face_preserve) * transformed_f
+        )
+
+        # Body: Medium preservation
+        body_blend = (
+            body_preserve * original_rgb +
+            (1 - body_preserve) * transformed_f
+        )
+
+        # Background: Full transformation
+        bg_blend = (
+            (1 - bg_transform) * original_rgb +
+            bg_transform * transformed_f
+        )
+
+        # Combine all regions
+        # Priority: face > body > background
+        blended = bg_blend.copy()
+
+        # Apply body blend where body mask is active
+        body_alpha = body_mask_3ch
+        blended = blended * (1 - body_alpha) + body_blend * body_alpha
+
+        # Apply face blend where face mask is active (highest priority)
+        face_alpha = face_mask_3ch
+        blended = blended * (1 - face_alpha) + face_blend * face_alpha
+
+        # Ensure valid range
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
 
         return cv2.cvtColor(blended, cv2.COLOR_RGB2BGR)
 
@@ -529,7 +1017,9 @@ class CloudFrameProcessor:
             'fps': self.fps,
             'process_ms': self.process_time * 1000,
             'queue': self.input_queue.qsize(),
-            'total_frames': self._total_frames
+            'total_frames': self._total_frames,
+            'persons_detected': self.last_detected_persons,
+            'gender': self.last_detected_gender.value
         }
 
 
@@ -660,12 +1150,29 @@ class DreamVisionCloud:
 
         # Initialize components
         print("\n[Init] Loading components...")
-        self.segmenter = CloudPersonSegmenter((self.config.width, self.config.height))
+
+        # Multi-person detector with gender detection
+        self.person_detector = MultiPersonDetector(self.config)
+
+        # Advanced segmenter for face/body preservation
+        self.segmenter = AdvancedSegmenter(self.config)
+
+        # Diffusion pipeline
         self.pipeline = CloudDiffusionPipeline(self.config)
-        self.processor = CloudFrameProcessor(self.pipeline, self.segmenter, self.config)
+
+        # Frame processor with all components
+        self.processor = CloudFrameProcessor(
+            self.pipeline,
+            self.person_detector,
+            self.segmenter,
+            self.config
+        )
+
+        # Video handler
         self.video = VideoHandler(self.config)
 
         print("\n[Init] Ready!")
+        print(f"[Init] Features: Multi-person detection, Gender detection, Face/Body preservation")
         print()
 
     def run(self):
@@ -731,6 +1238,8 @@ class DreamVisionCloud:
                           f"FPS: {stats['fps']:.1f} | "
                           f"Latency: {stats['process_ms']:.0f}ms | "
                           f"Frames: {stats['total_frames']} | "
+                          f"Persons: {stats.get('persons_detected', 0)} | "
+                          f"Gender: {stats.get('gender', 'unknown')} | "
                           f"Elapsed: {elapsed:.0f}s")
                     last_print = now
 
@@ -771,6 +1280,10 @@ class DreamVisionCloud:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display, f"Frame: {stats['total_frames']}", (10, 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display, f"Persons: {stats.get('persons_detected', 0)}", (10, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display, f"Gender: {stats.get('gender', 'unknown')}", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         cv2.imshow(self.config.window_name, display)
 
@@ -780,6 +1293,7 @@ class DreamVisionCloud:
         self.processor.stop()
         self.video.release()
         self.segmenter.release()
+        self.person_detector.release()
         torch.cuda.empty_cache()
         cv2.destroyAllWindows()
         print("[Cleanup] Done")
@@ -835,6 +1349,14 @@ Examples:
     parser.add_argument("--model", type=str, default="stabilityai/sdxl-turbo",
                        help="Model ID (default: stabilityai/sdxl-turbo)")
 
+    # Face/Body preservation options
+    parser.add_argument("--face-preserve", type=float, default=0.85,
+                       help="Face preservation strength 0.0-1.0 (default: 0.85)")
+    parser.add_argument("--body-preserve", type=float, default=0.60,
+                       help="Body preservation strength 0.0-1.0 (default: 0.60)")
+    parser.add_argument("--no-gender-detection", action="store_true",
+                       help="Disable gender detection")
+
     return parser.parse_args()
 
 
@@ -856,10 +1378,14 @@ def main():
         output_path=args.output,
         output_fps=args.fps,
         headless=not args.no_headless,
+        # Face/Body preservation settings
+        face_preservation_strength=args.face_preserve,
+        body_preservation_strength=args.body_preserve,
+        enable_gender_detection=not args.no_gender_detection,
     )
 
     if args.prompt:
-        config.prompt = args.prompt
+        config.base_prompt = args.prompt
 
     # Run application
     app = DreamVisionCloud(config)

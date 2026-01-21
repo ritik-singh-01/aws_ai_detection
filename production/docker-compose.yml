@@ -1,0 +1,186 @@
+# =============================================================================
+# Dream Vision - Docker Compose Configuration
+# Production-ready orchestration for GPU-accelerated AI processing
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # Main Dream Vision Processing Service
+  # ===========================================================================
+  dreamvision:
+    build:
+      context: ..
+      dockerfile: production/Dockerfile
+    image: dreamvision:latest
+    container_name: dreamvision-processor
+
+    # GPU Configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # Environment Variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - HF_HOME=/app/models
+      - TRANSFORMERS_CACHE=/app/models
+      - TORCH_HOME=/app/models
+      # Hugging Face token (optional - for gated models)
+      # - HF_TOKEN=${HF_TOKEN}
+
+    # Volume Mounts
+    volumes:
+      # Input videos
+      - ./input:/app/input:ro
+      # Output videos
+      - ./output:/app/output:rw
+      # Model cache (persistent - avoids re-downloading)
+      - dreamvision-models:/app/models
+      # Logs
+      - ./logs:/app/logs:rw
+
+    # Resource Limits
+    shm_size: '8gb'  # Shared memory for PyTorch DataLoader
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    # Restart Policy
+    restart: unless-stopped
+
+    # Health Check
+    healthcheck:
+      test: ["CMD", "python3.11", "-c", "import torch; assert torch.cuda.is_available()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    # Default command (override with docker-compose run)
+    command: ["--help"]
+
+  # ===========================================================================
+  # Batch Processing Service (for multiple videos)
+  # ===========================================================================
+  dreamvision-batch:
+    build:
+      context: ..
+      dockerfile: production/Dockerfile
+    image: dreamvision:latest
+    container_name: dreamvision-batch
+    profiles:
+      - batch
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/models
+
+    volumes:
+      - ./input:/app/input:ro
+      - ./output:/app/output:rw
+      - dreamvision-models:/app/models
+      - ./logs:/app/logs:rw
+
+    shm_size: '8gb'
+
+    # Batch processing script
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Starting batch processing..."
+        for video in /app/input/*.mp4; do
+          if [ -f "$$video" ]; then
+            filename=$$(basename "$$video" .mp4)
+            echo "Processing: $$filename"
+            python3.11 dream_vision_cloud.py \
+              --input "$$video" \
+              --output "/app/output/$${filename}_dreamvision.mp4"
+          fi
+        done
+        echo "Batch processing complete!"
+
+  # ===========================================================================
+  # Monitoring Service (Optional - Prometheus metrics)
+  # ===========================================================================
+  nvidia-exporter:
+    image: utkuozdemir/nvidia_gpu_exporter:1.1.0
+    container_name: nvidia-exporter
+    profiles:
+      - monitoring
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "9835:9835"
+
+    restart: unless-stopped
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  # Persistent model cache (avoids re-downloading ~5GB models)
+  dreamvision-models:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  default:
+    name: dreamvision-network
+
+# =============================================================================
+# Usage Examples:
+# =============================================================================
+#
+# 1. Build the image:
+#    docker-compose build
+#
+# 2. Process a single video:
+#    docker-compose run --rm dreamvision \
+#        --input /app/input/video.mp4 \
+#        --output /app/output/result.mp4
+#
+# 3. Process with custom settings:
+#    docker-compose run --rm dreamvision \
+#        --input /app/input/video.mp4 \
+#        --output /app/output/result.mp4 \
+#        --width 1024 --height 1024 \
+#        --prompt "cyberpunk neon style"
+#
+# 4. Batch process all videos in input folder:
+#    docker-compose --profile batch up dreamvision-batch
+#
+# 5. Start with monitoring:
+#    docker-compose --profile monitoring up -d
+#
+# 6. View logs:
+#    docker-compose logs -f dreamvision
+#
+# 7. Stop all services:
+#    docker-compose down
+#
+# =============================================================================
