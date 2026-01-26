@@ -157,6 +157,9 @@ class CloudConfig:
     output_path: str = "output_dreamvision.mp4"
     output_fps: int = 30
 
+    # Stream Output (RTMP)
+    stream_output_url: str = ""  # RTMP URL to push processed frames
+
     # Display (for testing with X11 forwarding)
     headless: bool = True  # True for cloud deployment
     window_name: str = "Dream Vision - AWS Cloud"
@@ -1033,6 +1036,7 @@ class VideoHandler:
         self.config = config
         self.cap = None
         self.writer = None
+        self.stream_writer = None  # FFmpeg process for RTMP output
         self.total_frames = 0
         self.current_frame = 0
 
@@ -1048,14 +1052,32 @@ class VideoHandler:
                 return False
             self.cap = cv2.VideoCapture(source)
         elif self.config.input_mode == "stream":
-            self.cap = cv2.VideoCapture(source)  # RTMP/HTTP stream URL
+            # RTMP/HTTP stream URL - set low latency buffer
+            self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer for low latency
         else:
             print(f"[VideoHandler] Unknown input mode: {self.config.input_mode}")
             return False
 
         if not self.cap.isOpened():
             print("[VideoHandler] Failed to open input source")
-            return False
+            if self.config.input_mode == "stream":
+                print(f"[VideoHandler] Make sure the stream is active at: {source}")
+                print("[VideoHandler] Waiting for stream...")
+                # Retry for stream mode (webcam might not be streaming yet)
+                for attempt in range(30):
+                    time.sleep(2)
+                    self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+                    if self.cap.isOpened():
+                        print(f"[VideoHandler] Stream connected after {(attempt+1)*2}s")
+                        break
+                    print(f"[VideoHandler] Retry {attempt+1}/30...")
+                else:
+                    print("[VideoHandler] Could not connect to stream after 60s")
+                    return False
+            else:
+                return False
 
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -1066,7 +1088,12 @@ class VideoHandler:
         return True
 
     def open_output(self) -> bool:
-        """Open video output"""
+        """Open video output (file or RTMP stream)"""
+
+        # Open RTMP stream output if configured
+        if self.config.stream_output_url:
+            return self._open_stream_output()
+
         if self.config.output_mode != "video":
             return True
 
@@ -1085,6 +1112,52 @@ class VideoHandler:
         print(f"[VideoHandler] Output: {self.config.output_path} @ {self.config.output_fps}fps")
         return True
 
+    def _open_stream_output(self) -> bool:
+        """Open FFmpeg process for RTMP output streaming"""
+        import subprocess
+
+        url = self.config.stream_output_url
+        w = self.config.width
+        h = self.config.height
+        fps = self.config.output_fps
+
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{w}x{h}',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-b:v', '3000k',
+            '-maxrate', '3000k',
+            '-bufsize', '1500k',
+            '-pix_fmt', 'yuv420p',
+            '-g', str(fps),  # Keyframe every second
+            '-f', 'flv',
+            url
+        ]
+
+        try:
+            self.stream_writer = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print(f"[VideoHandler] Stream output: {url}")
+            return True
+        except FileNotFoundError:
+            print("[VideoHandler] FFmpeg not found! Install with: sudo apt install ffmpeg")
+            return False
+        except Exception as e:
+            print(f"[VideoHandler] Failed to open stream output: {e}")
+            return False
+
     def read_frame(self) -> Optional[np.ndarray]:
         """Read next frame"""
         if self.cap is None:
@@ -1094,12 +1167,24 @@ class VideoHandler:
         if ret:
             self.current_frame += 1
             return frame
+
+        # For streams, a failed read doesn't mean end - it could be a dropped frame
+        if self.config.input_mode == "stream":
+            return self.read_frame()  # Retry once
+
         return None
 
     def write_frame(self, frame: np.ndarray):
-        """Write frame to output"""
+        """Write frame to output (file or RTMP stream)"""
         if self.writer is not None:
             self.writer.write(frame)
+
+        if self.stream_writer is not None and self.stream_writer.stdin:
+            try:
+                self.stream_writer.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                print("[VideoHandler] Stream output pipe broken - viewer may have disconnected")
+                self.stream_writer = None
 
     def get_progress(self) -> float:
         """Get processing progress (0.0 to 1.0)"""
@@ -1113,6 +1198,13 @@ class VideoHandler:
             self.cap.release()
         if self.writer is not None:
             self.writer.release()
+        if self.stream_writer is not None:
+            try:
+                if self.stream_writer.stdin:
+                    self.stream_writer.stdin.close()
+                self.stream_writer.wait(timeout=5)
+            except Exception:
+                self.stream_writer.kill()
 
 
 # ============================================================================
@@ -1204,11 +1296,17 @@ class DreamVisionCloud:
             if not self.config.headless:
                 cv2.namedWindow(self.config.window_name, cv2.WINDOW_NORMAL)
 
+            is_live = self.config.input_mode in ("stream", "webcam")
+
             while True:
                 # Read frame
                 frame = self.video.read_frame()
                 if frame is None:
-                    # Wait for remaining frames to process
+                    if is_live:
+                        # Live stream - keep waiting for frames
+                        time.sleep(0.01)
+                        continue
+                    # Video file - done
                     print("\n[Processing] Input complete, processing remaining frames...")
                     time.sleep(2)
                     break
@@ -1330,6 +1428,10 @@ Examples:
     parser.add_argument("--mode", "-m", type=str, default="video",
                        choices=["video", "webcam", "stream"],
                        help="Input mode (default: video)")
+    parser.add_argument("--stream-url", type=str, default=None,
+                       help="RTMP input stream URL (sets mode to stream)")
+    parser.add_argument("--stream-output", type=str, default=None,
+                       help="RTMP output stream URL to push processed video")
     parser.add_argument("--width", "-W", type=int, default=768,
                        help="Processing width (default: 768)")
     parser.add_argument("--height", "-H", type=int, default=768,
@@ -1364,6 +1466,15 @@ def main():
     """Main entry point"""
     args = parse_args()
 
+    # Determine input mode and source
+    input_mode = args.mode
+    input_source = args.input
+
+    # --stream-url overrides mode and input
+    if args.stream_url:
+        input_mode = "stream"
+        input_source = args.stream_url
+
     # Build config from arguments
     config = CloudConfig(
         width=args.width,
@@ -1372,12 +1483,13 @@ def main():
         num_inference_steps=args.steps,
         denoising_strength=args.strength,
         fixed_seed=args.seed,
-        input_mode=args.mode,
-        input_source=args.input,
+        input_mode=input_mode,
+        input_source=input_source,
         output_mode="video",
         output_path=args.output,
         output_fps=args.fps,
         headless=not args.no_headless,
+        stream_output_url=args.stream_output or "",
         # Face/Body preservation settings
         face_preservation_strength=args.face_preserve,
         body_preservation_strength=args.body_preserve,
